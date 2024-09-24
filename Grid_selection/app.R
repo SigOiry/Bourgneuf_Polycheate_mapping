@@ -2,7 +2,8 @@
 library(shiny)
 library(leaflet)
 library(sf)
-library(utils)   # For zip function
+library(openxlsx)   # For writing Excel files
+library(zip)        # For creating ZIP files cross-platform
 
 # Load the shapefile (replace with your actual file path)
 shapefile_path <- "Data/Polycheate_reef_grid.shp"
@@ -24,13 +25,21 @@ ui <- fluidPage(
     # Fullscreen leaflet map output
     leafletOutput("mymap", width = "100%", height = "100%"),
     
-    # Add a panel for user controls
+    # Add a panel for user controls (top right)
     absolutePanel(
         top = 10, right = 10,
         width = "300px",
         style = "background-color: white; padding: 10px; border-radius: 10px;",
         # UI elements
         uiOutput("controls_ui")
+    ),
+    
+    # Add a panel for group counts (bottom left)
+    absolutePanel(
+        bottom = 10, left = 10,
+        width = "300px",
+        style = "background-color: white; padding: 10px; border-radius: 10px;",
+        uiOutput("group_counts_ui")
     ),
     
     # Remove extra margin/padding and ensure full-screen layout
@@ -58,6 +67,14 @@ server <- function(input, output, session) {
     # Reactive value to track if we're in edit mode
     rv <- reactiveValues(editMode = FALSE)
     
+    # Reactive value to track if the app has finished initializing
+    appInitialized <- reactiveVal(FALSE)
+    
+    # Set appInitialized to TRUE after the initial flush of the reactive system
+    session$onFlushed(function() {
+        appInitialized(TRUE)
+    }, once = TRUE)
+    
     # Function to assign groups to used cells
     assign_groups <- function() {
         isolate({
@@ -74,11 +91,18 @@ server <- function(input, output, session) {
                 # Sort used_cells by 'Maille_2' in alphabetical order
                 used_cells <- used_cells[order(used_cells$Maille_2), ]
                 
-                # Calculate number of cells per group
-                cells_per_group <- ceiling(num_cells / num_groups)
+                # Calculate cells per group to ensure the difference is at most 1
+                cells_per_group <- num_cells %/% num_groups  # Integer division
+                extra_cells <- num_cells %% num_groups       # Modulo operation
                 
-                # Assign group numbers sequentially based on the sorted order
-                group_numbers <- rep(1:num_groups, each=cells_per_group)[1:num_cells]
+                # Create a vector of group sizes
+                group_sizes <- rep(cells_per_group, num_groups)
+                if (extra_cells > 0) {
+                    group_sizes[1:extra_cells] <- group_sizes[1:extra_cells] + 1
+                }
+                
+                # Assign group numbers based on group sizes
+                group_numbers <- rep(1:num_groups, times = group_sizes)
                 
                 # Assign the group numbers to the 'Group' column of the used cells
                 used_cells$Group <- group_numbers
@@ -117,7 +141,7 @@ server <- function(input, output, session) {
                             opacity = 1.0,
                             fillOpacity = input$opacity_slider,
                             layerId = ~Maille_2,
-                            label = ~paste("Maille_2:", as.character(Maille_2), "<br>Group:", Group),
+                            label = ~paste(as.character(Maille_2), ";\n Group:", Group),
                             labelOptions = labelOptions(
                                 style = list(
                                     "color" = "black",
@@ -199,7 +223,7 @@ server <- function(input, output, session) {
             # Editing UI
             tagList(
                 actionButton("save_button", "Save"),
-                selectInput("selected_cell", "Select Cell (Maille_2):",
+                selectInput("selected_cell", "Select Cell :",
                             choices = grid_data_reactive$data$Maille_2,
                             selected = NULL),
                 actionButton("modify_button", "Modify")
@@ -218,10 +242,27 @@ server <- function(input, output, session) {
                 sliderInput("opacity_slider", "Adjust Grid Opacity:",
                             min = 0, max = 1, value = 0.5, step = 0.1),
                 sliderInput("num_groups", "Number of Groups:",
-                            min = 1, max = 20, value = 1, step = 1),
-                # Add the Export GPX Files button
-                downloadButton("export_button", "Export GPX Files")
+                            min = 1, max = 20, value = 6, step = 1),
+                # Add the Export button
+                downloadButton("export_button", "Export")
             )
+        }
+    })
+    
+    # Output for group counts
+    output$group_counts_ui <- renderUI({
+        used_data <- grid_data_reactive$data[grid_data_reactive$data$Used == 1, ]
+        if (nrow(used_data) > 0 && !all(is.na(used_data$Group))) {
+            counts <- table(used_data$Group)
+            counts_text <- paste("Group", names(counts),":",counts, "cells" )
+            # Create a div with the text
+            tagList(
+                lapply(counts_text, function(txt) {
+                    div(txt)
+                })
+            )
+        } else {
+            div("No groups available.")
         }
     })
     
@@ -231,10 +272,24 @@ server <- function(input, output, session) {
         update_map()
     })
     
-    # Observe the number of groups slider and update group assignments and map
+    # Modified observeEvent for input$num_groups
     observeEvent(input$num_groups, {
-        assign_groups()
-        update_map()
+        # Only proceed if the app has initialized
+        if (appInitialized()) {
+            # If the grid choice is 'all', switch to 'filtered' and update radio buttons
+            if (input$grid_choice == 'all') {
+                updateRadioButtons(session, "grid_choice", selected = "filtered")
+                # Show a notification or modal dialog if desired
+                showModal(modalDialog(
+                    title = "Switching to Used Grid",
+                    "To display group assignments, the app is displaying only selected cells.",
+                    easyClose = TRUE,
+                    footer = NULL
+                ))
+            }
+            assign_groups()
+            update_map()
+        }
     })
     
     # Observe the "Edit the grid" button click
@@ -327,7 +382,7 @@ server <- function(input, output, session) {
                 # Show a message to the user
                 showModal(modalDialog(
                     title = "Please Save Before Switching",
-                    "Please save your changes before switching to All Grid.",
+                    "Please save your changes before switching mode to see the entire grid.",
                     easyClose = TRUE,
                     footer = NULL
                 ))
@@ -340,33 +395,47 @@ server <- function(input, output, session) {
         }
     })
     
-    # Download handler for exporting GPX files
-    # Download handler for exporting GPX files
+    # Download handler for exporting files
     output$export_button <- downloadHandler(
         filename = function() {
-            paste("GPX_files_", Sys.Date(), ".zip", sep = "")
+            paste("Export_", Sys.Date(), ".zip", sep = "")
         },
         content = function(file) {
             # Create a temporary directory
             temp_dir <- tempdir()
+            export_dir <- file.path(temp_dir, "Export_Files")
+            dir.create(export_dir, showWarnings = FALSE, recursive = TRUE)
             
             # Ensure Group assignments are up-to-date
             assign_groups()
+            
+            # Fix invalid geometries
+            grid_data_reactive$data <- st_make_valid(grid_data_reactive$data)
             
             # Subset the used grid cells
             used_data <- grid_data_reactive$data[grid_data_reactive$data$Used == 1, ]
             
             num_groups <- input$num_groups
+            gpx_dir <- file.path(export_dir, "GPX_Files")
+            dir.create(gpx_dir, showWarnings = FALSE, recursive = TRUE)
             gpx_files <- c()
             
+            # Define a suitable projected CRS (e.g., UTM zone appropriate for your data)
+            # Replace 'your_epsg_code' with the appropriate EPSG code
+            projected_crs <- 2154  # Example: RGF93 / Lambert-93 for France
+            
+            # Generate GPX files for each group
             for (g in 1:num_groups) {
                 group_data <- used_data[used_data$Group == g, ]
                 if (nrow(group_data) > 0) {
-                    # Calculate point within each polygon
-                    centroids <- st_point_on_surface(group_data)
+                    # Transform to projected CRS
+                    group_data_proj <- st_transform(group_data, crs = projected_crs)
                     
-                    # Ensure centroids are in WGS84 (EPSG:4326)
-                    centroids <- st_transform(centroids, crs = 4326)
+                    # Calculate point within each polygon
+                    centroids_proj <- st_point_on_surface(group_data_proj)
+                    
+                    # Transform centroids back to WGS84
+                    centroids <- st_transform(centroids_proj, crs = 4326)
                     
                     # Create a 'name' field for GPX
                     centroids$name <- as.character(centroids$Maille_2)
@@ -375,7 +444,7 @@ server <- function(input, output, session) {
                     centroids <- centroids[, c("name", "geometry")]
                     
                     # Define file path
-                    gpx_file <- file.path(temp_dir, paste0("Group_", g, ".gpx"))
+                    gpx_file <- file.path(gpx_dir, paste0("Group_", g, ".gpx"))
                     
                     # Delete the file if it exists
                     if (file.exists(gpx_file)) {
@@ -394,12 +463,58 @@ server <- function(input, output, session) {
                     gpx_files <- c(gpx_files, gpx_file)
                 }
             }
-            # Zip the GPX files
-            zip(zipfile = file, files = gpx_files, flags = "-j")
+            
+            # Save the shapefile of the grid with group information
+            grid_shapefile_dir <- file.path(export_dir, "Grid_Shapefile")
+            dir.create(grid_shapefile_dir, showWarnings = FALSE, recursive = TRUE)
+            grid_shapefile <- file.path(grid_shapefile_dir, "Grid_with_Groups.shp")
+            
+            # Write the shapefile
+            st_write(
+                grid_data_reactive$data,
+                grid_shapefile,
+                driver = "ESRI Shapefile",
+                delete_layer = TRUE,
+                quiet = TRUE
+            )
+            
+            # Prepare the Excel file
+            # Transform used_data to projected CRS
+            used_data_proj <- st_transform(used_data, crs = projected_crs)
+            
+            # Calculate centroids
+            centroids_proj <- st_centroid(used_data_proj)
+            
+            # Transform centroids back to WGS84
+            centroids <- st_transform(centroids_proj, crs = 4326)
+            
+            coords <- st_coordinates(centroids)
+            
+            # Create a data frame
+            excel_data <- data.frame(
+                Maille_2 = centroids$Maille_2,
+                X = coords[, "X"],
+                Y = coords[, "Y"],
+                Group = centroids$Group
+            )
+            
+            # Write to Excel file
+            excel_file <- file.path(export_dir, "Grid_Centroids.xlsx")
+            write.xlsx(excel_data, excel_file, overwrite = TRUE)
+            
+            # Create the ZIP file
+            zip_file <- file.path(temp_dir, paste("Export_", Sys.Date(), ".zip", sep = ""))
+            zip::zipr(
+                zipfile = zip_file,
+                files = list.files(export_dir, full.names = TRUE, recursive = TRUE),
+                root = export_dir
+            )
+            
+            # Send the ZIP file to the user
+            file.copy(zip_file, file)
         },
         contentType = "application/zip"
     )
-    
 }
 
 # Run the application 
